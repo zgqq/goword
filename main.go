@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/z1003031335/go-fileutil"
 )
@@ -134,13 +135,29 @@ func query(word string) string {
 
 // Storage for storing and querying local data
 type Storage interface {
-	QueryWord(content string)
-	AddWord(content string)
+	QueryWord(content string) (*Word, bool)
+	AddWord(word *Word)
 }
 
 // FileStorage using file storage such as json,xml and so on.
 type FileStorage struct {
 	storage map[string]*Word
+}
+
+// QueryWord implement
+func (storage *FileStorage) QueryWord(word string) (*Word, bool) {
+	if localWord, ok := storage.storage[word]; ok {
+		localWord.QueryCount++
+		storage.serilize()
+		return localWord, true
+	}
+	return nil, false
+}
+
+// AddWord implement
+func (storage *FileStorage) AddWord(word *Word) {
+	storage.storage[word.Content] = word
+	storage.serilize()
 }
 
 // NewFileStorage creating a FileStorage and init it
@@ -214,22 +231,6 @@ func (storage *FileStorage) serilize() {
 	fileutil.Marshal(storage.getSerilizeLocation(), storage.storage)
 }
 
-// QueryWord implement
-func (storage *FileStorage) QueryWord(word string) (*Word, bool) {
-	if localWord, ok := storage.storage[word]; ok {
-		localWord.QueryCount++
-		storage.serilize()
-		return localWord, true
-	}
-	return nil, false
-}
-
-// AddWord implement
-func (storage *FileStorage) AddWord(word *Word) {
-	storage.storage[word.Content] = word
-	storage.serilize()
-}
-
 // Export file
 type Export interface {
 	Export(wordList []*Word)
@@ -251,10 +252,14 @@ const (
 	ExportQueryCount
 )
 
+// Filter export data
+type Filter func(*Word) bool
+
 // ExportStrategy export strategy
 type ExportStrategy struct {
 	ExportTargets []*ExportTarget
 	Separator     string
+	Filter        Filter
 }
 
 // AddExportTarget add export
@@ -273,12 +278,12 @@ func (export *AbsExport) getExportString(wordList []*Word, wordSeparator string)
 		return ""
 	}
 	buffer := bytes.NewBufferString("")
-	for _, word := range wordList {
-		if word == nil {
+	for i, word := range wordList {
+		if word == nil || !export.ExportStrategy.Filter(word) {
 			continue
 		}
 		fmt.Println("Exporting ", word)
-		for i, exportTarget := range export.ExportStrategy.ExportTargets {
+		for _, exportTarget := range export.ExportStrategy.ExportTargets {
 			insSep := false
 			if (exportTarget.ExportObject & ExportWord) != 0 {
 				buffer.WriteString(word.Content)
@@ -291,9 +296,9 @@ func (export *AbsExport) getExportString(wordList []*Word, wordSeparator string)
 				buffer.WriteString(word.Content)
 				insSep = true
 			}
-			if i != len(export.ExportStrategy.ExportTargets)-1 {
-				buffer.WriteString(wordSeparator)
-			}
+		}
+		if i != len(export.ExportStrategy.ExportTargets)-1 {
+			buffer.WriteString(wordSeparator)
 		}
 	}
 	return buffer.String()
@@ -323,23 +328,172 @@ type Word struct {
 }
 
 // ExportToTxtFile export to file
-func ExportToTxtFile(storage *FileStorage) {
+func ExportToTxtFile(storage interface{}, strategy *ExportStrategy) {
 	expLoc := InstallDir + "/export_data.txt"
 	log.Println("Exporting to " + expLoc)
-	strategy := &ExportStrategy{}
-	strategy.AddExportTarget(&ExportTarget{
-		ExportObject: ExportWord,
-	})
 	export := &TxtExport{
 		ExportLocation: expLoc,
 	}
 	export.ExportStrategy = strategy
-	wordList := make([]*Word, len(storage.storage))
-	for _, wordEntry := range storage.storage {
-		wordList = append(wordList, wordEntry)
+	switch storage.(type) {
+	case *FileStorage:
+		fileStorage := storage.(*FileStorage)
+		wordList := make([]*Word, len(fileStorage.storage))
+		for _, wordEntry := range fileStorage.storage {
+			wordList = append(wordList, wordEntry)
+		}
+		export.Export(wordList)
+	default:
+		log.Fatal("Not found storage", storage)
 	}
-	export.Export(wordList)
 	log.Println("Export done!")
+}
+
+func isOption(opt string) bool {
+	opts := []string{"--export", "--filter", "--exclude-zh"}
+	isOpt := false
+	for _, val := range opts {
+		isOpt = strings.HasPrefix(opt, val)
+		if isOpt {
+			return true
+		}
+	}
+	return false
+}
+
+func getArgValue(i *int, args []string) (string, bool) {
+	hasValue := (*i) != len(args)-1 && !isOption(args[(*i)+1])
+	if hasValue {
+		(*i)++
+		return args[(*i)], hasValue
+	}
+	return "", false
+}
+
+func applyArgValue(i *int, args []string, arg *string) {
+	if value, ok := getArgValue(i, args); ok {
+		*arg = value
+	}
+}
+
+// Condi export condition
+type Condi int
+
+const (
+	// GreaterThan 1
+	GreaterThan = iota
+	// LessThan 2
+	LessThan
+	// GreaterOrEqual 3
+	GreaterOrEqual
+	// LessOrEqual 4
+	LessOrEqual
+	// Equal 5
+	Equal
+)
+
+// FilterCondi filter condition
+type FilterCondi struct {
+	IsQueryCount bool
+	Condi        Condi
+	QCValue      int
+}
+
+// Arguments argument object
+type Arguments struct {
+	IsExport    bool
+	ExportLoc   string
+	FilterCondi *FilterCondi
+	ExcludeZh   bool
+}
+
+// HandleExport handle export
+func HandleExport(storage interface{}, argument *Arguments) {
+	strategy := &ExportStrategy{}
+	strategy.Filter = func(word *Word) bool {
+		_, sz := utf8.DecodeRuneInString(word.Content)
+		if argument.ExcludeZh && sz == 3 {
+			return false
+		}
+		if !argument.FilterCondi.IsQueryCount {
+			return true
+		}
+		condi := argument.FilterCondi.Condi
+		qcValue := argument.FilterCondi.QCValue
+		switch condi {
+		case GreaterThan:
+			return word.QueryCount > qcValue
+		case GreaterOrEqual:
+			return word.QueryCount >= qcValue
+		case LessThan:
+			return word.QueryCount < qcValue
+		case LessOrEqual:
+			return word.QueryCount <= qcValue
+		case Equal:
+			return word.QueryCount == qcValue
+		}
+		return true
+	}
+	strategy.AddExportTarget(&ExportTarget{
+		ExportObject: ExportWord,
+	})
+	ExportToTxtFile(storage, strategy)
+}
+
+// ParseArgs parse arguments
+func ParseArgs(args []string) *Arguments {
+	arguments := &Arguments{}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--export":
+			arguments.IsExport = true
+			applyArgValue(&i, args, &arguments.ExportLoc)
+		case "--filter":
+			if condi, ok := getArgValue(&i, args); ok {
+				arguments.FilterCondi = parseCondition(condi)
+			}
+		case "--exclude-zh":
+			arguments.ExcludeZh = true
+		}
+	}
+	return arguments
+}
+
+func parseCondition(condiStr string) *FilterCondi {
+	filterCondi := &FilterCondi{}
+	var condi Condi
+	if strings.HasPrefix(condiStr, "q") {
+		filterCondi.IsQueryCount = true
+		c := condiStr[1]
+		qc := 0
+		var err error
+		if c == '>' {
+			if condiStr[2] == '=' {
+				condi = GreaterOrEqual
+				qc, err = strconv.Atoi(condiStr[3:])
+			} else {
+				condi = GreaterThan
+				qc, err = strconv.Atoi(condiStr[2:])
+			}
+		} else if c == '<' {
+			if condiStr[2] == '=' {
+				condi = LessOrEqual
+				qc, err = strconv.Atoi(condiStr[3:])
+			} else {
+				condi = LessThan
+				qc, err = strconv.Atoi(condiStr[2:])
+			}
+		} else if c == '=' {
+			qc, err = strconv.Atoi(condiStr[2:])
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		filterCondi.Condi = condi
+		filterCondi.QCValue = qc
+	}
+	return filterCondi
 }
 
 // Init check install dir,log and so on.
@@ -360,10 +514,10 @@ func main() {
 		fmt.Println("Please input word!")
 		return
 	}
-	if os.Args[1] == "--export" {
-		return
+	arguments := ParseArgs(os.Args[1:])
+	if arguments.IsExport {
+		HandleExport(storage, arguments)
 	}
-
 	queryWord := strings.Join(os.Args[1:], " ")
 	fmt.Println(queryWord + " ~ fanyi.youdao.com")
 	var word *Word
@@ -381,7 +535,9 @@ func main() {
 			storage.AddWord(word)
 		}
 	}
+
 	fmt.Println("translation:" + word.TranslatedContent)
 	fmt.Println("explains:", word.Explains)
 	fmt.Println("has been queried " + strconv.Itoa(word.QueryCount) + " times")
+
 }
