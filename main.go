@@ -13,9 +13,10 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
-	"github.com/z1003031335/go-fileutil"
+	utils "github.com/zgqq/goword/util"
 )
 
 // QR indicates query result
@@ -77,6 +78,43 @@ func getBytes(url string, data url.Values) ([]byte, error) {
 	}
 	bytes, err := ioutil.ReadAll(resp.Body)
 	return bytes, err
+}
+
+type Statistics struct {
+	QueryCount int
+}
+
+var stats map[string]*Statistics
+var StatFileLoc string
+
+func InitStat() {
+	CheckInit()
+	StatFileLoc = InstallDir + "/stat.json"
+	utils.CreateFileIfNotExist(StatFileLoc)
+	stats = make(map[string]*Statistics)
+	utils.Unmarshal(StatFileLoc, &stats)
+}
+
+func LoadTodayStat() *Statistics {
+	InitStat()
+	now := time.Now()
+	date := now.Format("2006-01-02")
+	var today *Statistics
+	var ok bool
+	if today, ok = stats[date]; !ok {
+		today = &Statistics{
+			QueryCount: 0,
+		}
+		stats[date] = today
+	}
+	return today
+}
+
+func IncrementTodayQueryCount() *Statistics {
+	today := LoadTodayStat()
+	today.QueryCount++
+	utils.Marshal(StatFileLoc, &stats)
+	return today
 }
 
 // Query implementing youdao
@@ -210,7 +248,12 @@ func unmarshal(filename string, inter interface{}) {
 var InstallDir string
 
 func checkInstallDir() bool {
-	InstallDir = os.Getenv("HOME") + "/app/go-word"
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if len(xdg) == 0 {
+		InstallDir = os.Getenv("HOME") + "/.config/goword"
+	} else {
+		InstallDir = xdg + "/goword"
+	}
 	return createDirectoryIfNotExist(InstallDir)
 }
 
@@ -227,8 +270,12 @@ func (storage *FileStorage) getSerilizeLocation() string {
 	return InstallDir + "/data.json"
 }
 
+func Marshal(filename string, inter interface{}) {
+	configBytes, _ := json.Marshal(inter)
+	_ = ioutil.WriteFile(filename, configBytes, 0755)
+}
 func (storage *FileStorage) serilize() {
-	fileutil.Marshal(storage.getSerilizeLocation(), storage.storage)
+	Marshal(storage.getSerilizeLocation(), storage.storage)
 }
 
 // Export file
@@ -282,7 +329,6 @@ func (export *AbsExport) getExportString(wordList []*Word, wordSeparator string)
 		if word == nil || !export.ExportStrategy.Filter(word) {
 			continue
 		}
-		fmt.Println("Exporting ", word)
 		for _, exportTarget := range export.ExportStrategy.ExportTargets {
 			insSep := false
 			if (exportTarget.ExportObject & ExportWord) != 0 {
@@ -304,10 +350,21 @@ func (export *AbsExport) getExportString(wordList []*Word, wordSeparator string)
 	return buffer.String()
 }
 
+//PrintExport print
+type PrintExport struct {
+	AbsExport
+}
+
 // TxtExport txt file
 type TxtExport struct {
 	AbsExport
 	ExportLocation string
+}
+
+// Export print file export impl
+func (printExport *PrintExport) Export(wordList []*Word) {
+	exportStr := printExport.getExportString(wordList, "\n")
+	fmt.Println(exportStr)
 }
 
 // Export txt file export impl
@@ -327,30 +384,28 @@ type Word struct {
 	Explains          []string
 }
 
+func convertList(wordMap map[string]*Word) []*Word {
+	wordList := make([]*Word, len(wordMap))
+	for _, wordEntry := range wordMap {
+		wordList = append(wordList, wordEntry)
+	}
+	return wordList
+}
+
 // ExportToTxtFile export to file
-func ExportToTxtFile(storage interface{}, strategy *ExportStrategy) {
+func ExportToTxtFile(wordList []*Word, strategy *ExportStrategy) {
 	expLoc := InstallDir + "/export_data.txt"
 	log.Println("Exporting to " + expLoc)
 	export := &TxtExport{
 		ExportLocation: expLoc,
 	}
 	export.ExportStrategy = strategy
-	switch storage.(type) {
-	case *FileStorage:
-		fileStorage := storage.(*FileStorage)
-		wordList := make([]*Word, len(fileStorage.storage))
-		for _, wordEntry := range fileStorage.storage {
-			wordList = append(wordList, wordEntry)
-		}
-		export.Export(wordList)
-	default:
-		log.Fatal("Not found storage", storage)
-	}
+	export.Export(wordList)
 	log.Println("Export done!")
 }
 
 func isOption(opt string) bool {
-	opts := []string{"--export", "--filter", "--exclude-zh"}
+	opts := []string{"--list", "--export", "--filter", "--exclude-zh"}
 	isOpt := false
 	for _, val := range opts {
 		isOpt = strings.HasPrefix(opt, val)
@@ -401,14 +456,27 @@ type FilterCondi struct {
 
 // Arguments argument object
 type Arguments struct {
+	IsList      bool
 	IsExport    bool
 	ExportLoc   string
 	FilterCondi *FilterCondi
 	ExcludeZh   bool
 }
 
-// HandleExport handle export
-func HandleExport(storage interface{}, argument *Arguments) {
+func exportToPrinter(wordList []*Word, strategy *ExportStrategy) {
+	export := &PrintExport{}
+	export.ExportStrategy = strategy
+	export.Export(wordList)
+}
+
+//HandleList print handle list
+func HandleList(storage interface{}, arugment *Arguments) {
+	strategy := getExportStrategy(arugment)
+	wordList := getWordList(storage)
+	exportToPrinter(wordList, strategy)
+}
+
+func getExportStrategy(argument *Arguments) *ExportStrategy {
 	strategy := &ExportStrategy{}
 	strategy.Filter = func(word *Word) bool {
 		_, sz := utf8.DecodeRuneInString(word.Content)
@@ -437,7 +505,26 @@ func HandleExport(storage interface{}, argument *Arguments) {
 	strategy.AddExportTarget(&ExportTarget{
 		ExportObject: ExportWord,
 	})
-	ExportToTxtFile(storage, strategy)
+	return strategy
+}
+
+func getWordList(storage interface{}) []*Word {
+	var wordList []*Word
+	switch storage.(type) {
+	case *FileStorage:
+		fileStorage := storage.(*FileStorage)
+		wordList = convertList(fileStorage.storage)
+	default:
+		log.Fatal("Not found storage", storage)
+	}
+	return wordList
+}
+
+// HandleExport handle export
+func HandleExport(storage interface{}, argument *Arguments) {
+	strategy := getExportStrategy(argument)
+	wordList := getWordList(storage)
+	ExportToTxtFile(wordList, strategy)
 }
 
 // ParseArgs parse arguments
@@ -446,6 +533,8 @@ func ParseArgs(args []string) *Arguments {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
+		case "--list":
+			arguments.IsList = true
 		case "--export":
 			arguments.IsExport = true
 			applyArgValue(&i, args, &arguments.ExportLoc)
@@ -496,19 +585,25 @@ func parseCondition(condiStr string) *FilterCondi {
 	return filterCondi
 }
 
+var inited bool
+
 // Init check install dir,log and so on.
-func Init() {
+func CheckInit() {
+	if inited {
+		return
+	}
 	checkInstallDir()
-	logFile, err := os.OpenFile("/home/zgq/app/go-word/run.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+	logFile, err := os.OpenFile(InstallDir+"/run.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
 	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
+	inited = true
 }
 
 func main() {
-	Init()
+	CheckInit()
 	storage := NewFileStorage()
 	if len(os.Args) == 1 {
 		fmt.Println("Please input word!")
@@ -517,6 +612,10 @@ func main() {
 	arguments := ParseArgs(os.Args[1:])
 	if arguments.IsExport {
 		HandleExport(storage, arguments)
+		return
+	} else if arguments.IsList {
+		HandleList(storage, arguments)
+		return
 	}
 	queryWord := strings.Join(os.Args[1:], " ")
 	fmt.Println(queryWord + " ~ fanyi.youdao.com")
@@ -539,5 +638,6 @@ func main() {
 	fmt.Println("translation:" + word.TranslatedContent)
 	fmt.Println("explains:", word.Explains)
 	fmt.Println("has been queried " + strconv.Itoa(word.QueryCount) + " times")
-
+	today := IncrementTodayQueryCount()
+	fmt.Println("today query count in total", today.QueryCount)
 }
